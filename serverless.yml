@@ -1,0 +1,106 @@
+service: serverless-event-pipeline
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'prod'}
+  memorySize: 512
+  timeout: 30
+  environment:
+    DYNAMODB_TABLE: ${self:custom.tableName}
+    S3_BUCKET: ${self:custom.s3Bucket}
+    STAGE: ${self:provider.stage}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+          Resource:
+            - !GetAtt EventsTable.Arn
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+          Resource:
+            - !Sub "arn:aws:s3:::${self:custom.s3Bucket}/*"
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource:
+            - !GetAtt ProcessingQueue.Arn
+            - !GetAtt DeadLetterQueue.Arn
+
+custom:
+  tableName: ${self:service}-events-${self:provider.stage}
+  s3Bucket: ${self:service}-lake-${self:provider.stage}
+
+functions:
+  ingest:
+    handler: handlers/ingest_handler.lambda_handler
+    environment:
+      PROCESSING_QUEUE_URL: !Ref ProcessingQueue
+    events:
+      - http:
+          path: /events
+          method: post
+          cors: true
+
+  processor:
+    handler: handlers/process_handler.lambda_handler
+    events:
+      - sqs:
+          arn: !GetAtt ProcessingQueue.Arn
+          batchSize: 10
+          maximumBatchingWindow: 5
+          functionResponseType: ReportBatchItemFailures
+
+  dlqRedrive:
+    handler: handlers/dlq_redrive_handler.lambda_handler
+    environment:
+      PRIMARY_QUEUE_URL: !Ref ProcessingQueue
+      DLQ_URL: !Ref DeadLetterQueue
+
+resources:
+  Resources:
+    ProcessingQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-queue-${self:provider.stage}
+        VisibilityTimeout: 180
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+          maxReceiveCount: 3
+
+    DeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-dlq-${self:provider.stage}
+        MessageRetentionPeriod: 1209600
+
+    EventsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.tableName}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: pk
+            AttributeType: S
+          - AttributeName: sk
+            AttributeType: S
+        KeySchema:
+          - AttributeName: pk
+            KeyType: HASH
+          - AttributeName: sk
+            KeyType: RANGE
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
